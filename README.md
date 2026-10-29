@@ -120,6 +120,16 @@ Dump plus upload took 58 s. Restore onto an empty volume took 56 s, download
 included, and Postgres was accepting connections at 61 s. Table counts and
 digests over every block hash and extrinsic hash matched the source.
 
+Blockscout, the same day: production's API image (`explorer.quip.network:api-6685278`,
+Blockscout 9.0.2) indexed 3,052 recent aglais blocks into the db image, then
+went through dump, Storj and restore. Everything matched: 62 tables, 205
+indexes, 354 functions, 6 enum types, the btree_gin, btree_gist, citext and
+pg_trgm extensions, all 316 migrations, and block and transaction hash
+digests. The same API then started on the restored database with no error or
+duplicate-key lines and carried on from the restored height. Blockscout's
+catch-up fetcher filled the one new block its realtime fetcher had skipped
+("Index had to catch up", 1 block).
+
 Storj notes, from the scoped production keys: a key scoped to `<folder>/` may
 list unfinished multipart uploads only under that folder (the bucket-wide
 listing is AccessDenied), and it is refused in other folders and other buckets.
