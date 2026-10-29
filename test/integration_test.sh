@@ -22,6 +22,13 @@
 #
 # Run:  sh test/integration_test.sh
 #       SKIP_BUILD=1 to reuse already-built :test images.
+#
+# Against a real store (the gate MinIO cannot be):
+#       S3_TEST_ENV=<file> S3_TEST_ROOT=<prefix> sh test/integration_test.sh
+# <file> holds S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY lines, for
+# example a Storj key scoped to <prefix>. Everything the run writes lives under
+# <prefix>/run-<id>/ and is deleted on exit, dead multipart uploads included.
+#
 # Needs: docker. Leaves nothing behind (trap removes containers, volumes, net).
 # Exit: 0 = all pass, nonzero = a failure (name printed).
 
@@ -42,6 +49,19 @@ HB_HOST="${RUN}-hb"
 BUCKET="fpbrtest"
 S3_USER="fpbrtest"
 S3_PASS="fpbrtest-secret"
+S3_URL="http://${S3_HOST}:9000"
+ROOT=""
+EXTERNAL=""
+if [ -n "${S3_TEST_ENV:-}" ]; then
+    EXTERNAL=1
+    # shellcheck disable=SC1090
+    . "$S3_TEST_ENV"
+    : "${S3_TEST_ROOT:?S3_TEST_ROOT must name a prefix the key may write}"
+    S3_URL="$S3_ENDPOINT" BUCKET="$S3_BUCKET" S3_USER="$S3_ACCESS_KEY" S3_PASS="$S3_SECRET_KEY"
+    ROOT="${S3_TEST_ROOT%/}/run-${RUN}/"
+fi
+MAIN="${ROOT}main"     # the prefix most cases share
+NONE="${ROOT}none"     # stays empty
 HEIGHT_SQL="select coalesce(max(number),0) from blocks"
 PGDATA_IN="/var/lib/postgresql/data/pgdata-test"
 
@@ -62,6 +82,15 @@ CONTAINERS=""
 VOLUMES=""
 # shellcheck disable=SC2317  # reached through the trap
 cleanup() {
+    # Before the network and the xfer volume go: s3() needs both.
+    if [ -n "$EXTERNAL" ]; then
+        s3 s3 rm --recursive "s3://${BUCKET}/${ROOT}" --only-show-errors >/dev/null 2>&1
+        s3 s3api list-multipart-uploads --bucket "$BUCKET" --prefix "$ROOT" \
+            --query 'Uploads[].[Key,UploadId]' --output text 2>/dev/null | while read -r _k _id; do
+            [ -n "${_id:-}" ] || continue
+            s3 s3api abort-multipart-upload --bucket "$BUCKET" --key "$_k" --upload-id "$_id" >/dev/null 2>&1
+        done
+    fi
     # shellcheck disable=SC2086
     [ -z "$CONTAINERS" ] || docker rm -f $CONTAINERS >/dev/null 2>&1
     # shellcheck disable=SC2086
@@ -73,7 +102,7 @@ trap cleanup EXIT INT TERM
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 s3env() { # common S3 settings, as docker -e flags
-    printf '%s\n' -e "S3_ENDPOINT=http://${S3_HOST}:9000" -e "S3_BUCKET=${BUCKET}" \
+    printf '%s\n' -e "S3_ENDPOINT=${S3_URL}" -e "S3_BUCKET=${BUCKET}" \
         -e "S3_ACCESS_KEY=${S3_USER}" -e "S3_SECRET_KEY=${S3_PASS}"
 }
 
@@ -85,7 +114,7 @@ s3() {
         -e AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
         -e AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
         -v "${RUN}-xfer:/xfer" \
-        --entrypoint aws "$BK_IMG" --endpoint-url "http://${S3_HOST}:9000" "$@"
+        --entrypoint aws "$BK_IMG" --endpoint-url "$S3_URL" "$@"
 }
 
 keys() { # PREFIX -- keys under it, one per line, sorted
@@ -154,10 +183,14 @@ backup_once() {
     BK_RC=$?
 }
 
-uploads() { # PREFIX -- keys with an unfinished multipart upload. Lists the
-    # whole bucket: MinIO ignores a partial --prefix for this call.
-    s3 s3api list-multipart-uploads --bucket "$BUCKET" \
-        --query 'Uploads[].Key' --output text 2>/dev/null | tr '\t' '\n' | grep "^$1/" | LC_ALL=C sort
+uploads() { # PREFIX -- keys with an unfinished multipart upload. Both
+    # listings, as the loop does: MinIO ignores a partial --prefix for this
+    # call, and a prefix-scoped Storj key is refused the bucket-wide one.
+    { s3 s3api list-multipart-uploads --bucket "$BUCKET" --prefix "$1/" \
+          --query 'Uploads[].Key' --output text 2>/dev/null
+      s3 s3api list-multipart-uploads --bucket "$BUCKET" \
+          --query 'Uploads[].Key' --output text 2>/dev/null
+    } | tr '\t' '\n' | grep "^$1/" | LC_ALL=C sort -u
 }
 
 heartbeats() { # PREFIX -- how many pings the sink has seen for it
@@ -176,47 +209,54 @@ docker network create "$NET" >/dev/null
 VOLUMES="$VOLUMES ${RUN}-xfer"
 docker volume create "${RUN}-xfer" >/dev/null
 
-CONTAINERS="$CONTAINERS $S3_HOST $HB_HOST"
-docker run -d --name "$S3_HOST" --network "$NET" \
-    -e "MINIO_ROOT_USER=${S3_USER}" -e "MINIO_ROOT_PASSWORD=${S3_PASS}" \
-    "$S3_IMG" server /data >/dev/null
+CONTAINERS="$CONTAINERS $HB_HOST"
+if [ -z "$EXTERNAL" ]; then
+    CONTAINERS="$CONTAINERS $S3_HOST"
+    docker run -d --name "$S3_HOST" --network "$NET" \
+        -e "MINIO_ROOT_USER=${S3_USER}" -e "MINIO_ROOT_PASSWORD=${S3_PASS}" \
+        "$S3_IMG" server /data >/dev/null
+fi
 # A one-request-at-a-time HTTP sink; busybox nc prints each request line.
 docker run -d --name "$HB_HOST" --network "$NET" "$HB_IMG" sh -c \
     'while :; do printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" | nc -l -p 8080; done' >/dev/null
 
-i=0
-until s3 s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1; do
-    i=$((i + 1)); [ "$i" -lt 30 ] || { echo "FATAL: test S3 never came up"; exit 1; }
-    sleep 1
-done
+if [ -n "$EXTERNAL" ]; then
+    echo "external store: s3://${BUCKET}/${ROOT}"
+else
+    i=0
+    until s3 s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -lt 30 ] || { echo "FATAL: test S3 never came up"; exit 1; }
+        sleep 1
+    done
+fi
 
 # ── Cases ─────────────────────────────────────────────────────────────────────
 
 echo "first boot, nothing stored"
-start_db a main
+start_db a "$MAIN"
 wait_db a; assert_rc "postgres comes up" 0 $?
 assert_eq "database is empty" "0" "$(tables a)"
 assert_has "says why it is empty" "no dumps" "$(logs a)"
 
 echo "backup refuses an empty index"
-backup_once a main
+backup_once a "$MAIN"
 assert_rc "no dump taken" 1 "$BK_RC"
-assert_eq "nothing uploaded" "" "$(keys main)"
-assert_eq "no heartbeat" "0" "$(heartbeats main)"
+assert_eq "nothing uploaded" "" "$(keys "$MAIN")"
+assert_eq "no heartbeat" "0" "$(heartbeats "$MAIN")"
 
 echo "backup of an indexed database"
 seed a 500
-backup_once a main
+backup_once a "$MAIN"
 assert_rc "dump taken" 0 "$BK_RC"
-K500="$(keys main)"
+K500="$(keys "$MAIN")"
 case "$K500" in
-    main/testapp-*-h500.dump) pass "one key, carrying height 500" ;;
+    "$MAIN"/testapp-*-h500.dump) pass "one key, carrying height 500" ;;
     *) fail "one key, carrying height 500 (got '$K500')" ;;
 esac
-assert_eq "heartbeat sent" "1" "$(heartbeats main)"
+assert_eq "heartbeat sent" "1" "$(heartbeats "$MAIN")"
 
 echo "restore onto a fresh volume"
-start_db b main
+start_db b "$MAIN"
 wait_db b; assert_rc "postgres comes up" 0 $?
 assert_eq "height restored" "500" "$(sql b "$HEIGHT_SQL")"
 assert_eq "row content restored" "$(sql a "select payload from blocks where number=321")" \
@@ -226,33 +266,33 @@ docker exec "${RUN}-b" test -e "${PGDATA_IN}/.restore-in-progress.dump"
 assert_rc "temporary dump file removed" 1 $?
 
 echo "height guard"
-start_db c none
+start_db c "$NONE"
 wait_db c; seed c 100
-backup_once c main
+backup_once c "$MAIN"
 assert_rc "a lower index is not uploaded" 1 "$BK_RC"
 assert_has "says why" "refusing" "$BK_OUT"
-assert_eq "stored keys unchanged" "$K500" "$(keys main)"
-assert_eq "no heartbeat for a refused dump" "1" "$(heartbeats main)"
+assert_eq "stored keys unchanged" "$K500" "$(keys "$MAIN")"
+assert_eq "no heartbeat for a refused dump" "1" "$(heartbeats "$MAIN")"
 
 echo "retention and dead multipart uploads"
 # A cycle killed mid-upload leaves an unfinished multipart upload: invisible as
 # an object (so never restorable) but still holding storage until aborted.
-s3 s3api create-multipart-upload --bucket "$BUCKET" --key "main/testapp-20200101T000000Z-h1.dump" >/dev/null
-s3 s3api create-multipart-upload --bucket "$BUCKET" --key "main/otherapp-20200101T000000Z-h1.dump" >/dev/null
+s3 s3api create-multipart-upload --bucket "$BUCKET" --key "${MAIN}/testapp-20200101T000000Z-h1.dump" >/dev/null
+s3 s3api create-multipart-upload --bucket "$BUCKET" --key "${MAIN}/otherapp-20200101T000000Z-h1.dump" >/dev/null
 seed a 600; sleep 1
-backup_once a main -e BACKUP_RETENTION=2
+backup_once a "$MAIN" -e BACKUP_RETENTION=2
 assert_rc "dump at 600 taken" 0 "$BK_RC"
 seed a 700; sleep 1
-backup_once a main -e BACKUP_RETENTION=2
+backup_once a "$MAIN" -e BACKUP_RETENTION=2
 assert_rc "dump at 700 taken" 0 "$BK_RC"
-GOT="$(keys main | sed 's/.*-h//' | tr '\n' ' ')"
+GOT="$(keys "$MAIN" | sed 's/.*-h//' | tr '\n' ' ')"
 assert_eq "only the newest 2 remain" "600.dump 700.dump " "$GOT"
-assert_eq "our dead upload aborted, another app's untouched" "main/otherapp-20200101T000000Z-h1.dump" "$(uploads main)"
+assert_eq "our dead upload aborted, another app's untouched" "${MAIN}/otherapp-20200101T000000Z-h1.dump" "$(uploads "$MAIN")"
 
 echo "a restarted sidecar waits out the cadence"
 CONTAINERS="$CONTAINERS ${RUN}-loop"
 # shellcheck disable=SC2046
-docker run -d --name "${RUN}-loop" --network "$NET" $(bkenv a main) \
+docker run -d --name "${RUN}-loop" --network "$NET" $(bkenv a "$MAIN") \
     -e "HEIGHT_SQL=${HEIGHT_SQL}" -e BACKUP_INTERVAL=3600 "$BK_IMG" >/dev/null
 i=0
 until docker logs "${RUN}-loop" 2>&1 | grep -q "next dump in"; do
@@ -260,43 +300,43 @@ until docker logs "${RUN}-loop" 2>&1 | grep -q "next dump in"; do
     sleep 1
 done
 assert_has "schedules from the newest stored dump" "next dump in" "$(docker logs "${RUN}-loop" 2>&1)"
-assert_eq "no extra dump on start" "600.dump 700.dump " "$(keys main | sed 's/.*-h//' | tr '\n' ' ')"
+assert_eq "no extra dump on start" "600.dump 700.dump " "$(keys "$MAIN" | sed 's/.*-h//' | tr '\n' ' ')"
 docker rm -f "${RUN}-loop" >/dev/null
 
 echo "restore picks the newest"
-start_db d main
+start_db d "$MAIN"
 wait_db d; assert_rc "postgres comes up" 0 $?
 assert_eq "height is the newest dump's" "700" "$(sql d "$HEIGHT_SQL")"
 
 echo "corrupt newest dump falls back to empty"
 docker run --rm -v "${RUN}-xfer:/xfer" "$HB_IMG" sh -c 'head -c 4096 /dev/urandom > /xfer/garbage' >/dev/null
-s3 s3 cp /xfer/garbage "s3://${BUCKET}/main/testapp-29991231T235959Z-h999999.dump" --only-show-errors
-start_db e main
+s3 s3 cp /xfer/garbage "s3://${BUCKET}/${MAIN}/testapp-29991231T235959Z-h999999.dump" --only-show-errors
+start_db e "$MAIN"
 wait_db e; assert_rc "postgres still comes up" 0 $?
 assert_eq "database is empty, not half-restored" "0" "$(tables e)"
 assert_has "says the restore failed" "RESTORE FAILED" "$(logs e)"
-s3 s3 rm "s3://${BUCKET}/main/testapp-29991231T235959Z-h999999.dump" --only-show-errors
+s3 s3 rm "s3://${BUCKET}/${MAIN}/testapp-29991231T235959Z-h999999.dump" --only-show-errors
 
 echo "a dump lower than its key claims is rejected"
-NEWEST="$(keys main | tail -n 1)"
-s3 s3 cp "s3://${BUCKET}/${NEWEST}" "s3://${BUCKET}/main/testapp-29991231T235959Z-h900.dump" --only-show-errors
-start_db f main
+NEWEST="$(keys "$MAIN" | tail -n 1)"
+s3 s3 cp "s3://${BUCKET}/${NEWEST}" "s3://${BUCKET}/${MAIN}/testapp-29991231T235959Z-h900.dump" --only-show-errors
+start_db f "$MAIN"
 wait_db f; assert_rc "postgres still comes up" 0 $?
 assert_eq "database is empty" "0" "$(tables f)"
 assert_has "says the height did not match" "below the key's height" "$(logs f)"
-s3 s3 rm "s3://${BUCKET}/main/testapp-29991231T235959Z-h900.dump" --only-show-errors
+s3 s3 rm "s3://${BUCKET}/${MAIN}/testapp-29991231T235959Z-h900.dump" --only-show-errors
 
 echo "unreadable store falls back to empty"
-start_db g main -e S3_SECRET_KEY=wrong
+start_db g "$MAIN" -e S3_SECRET_KEY=wrong
 wait_db g; assert_rc "postgres still comes up" 0 $?
 assert_eq "database is empty" "0" "$(tables g)"
 assert_has "says the listing failed" "could not list" "$(logs g)"
 
 echo "backups not configured"
-start_db h main -e S3_BUCKET=
+start_db h "$MAIN" -e S3_BUCKET=
 wait_db h; assert_rc "postgres comes up" 0 $?
 assert_has "db says restore is off" "S3_BUCKET unset" "$(logs h)"
-backup_once a main -e S3_BUCKET=
+backup_once a "$MAIN" -e S3_BUCKET=
 assert_rc "sidecar takes no dump" 1 "$BK_RC"
 assert_has "sidecar says so loudly" "BACKUPS ARE NOT RUNNING" "$BK_OUT"
 

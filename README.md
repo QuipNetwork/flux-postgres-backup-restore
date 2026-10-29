@@ -86,7 +86,7 @@ so hourly instead of crash-looping.
 | `PGHOST` (sidecar) | `fluxsqdb_quipsubscan` | `fluxbsdb_quipexplorer` |
 | `DUMP_NAME` | `subscan` | `blockscout` |
 | Cadence / keep | 6 h / 4 | 1 h / 6 |
-| Sidecar volume | ~40 GB (12 GB database at block 192k) | ~2 GB (315 MB database) |
+| Sidecar volume | ~40 GB (12 GB database at block 192k; dump ≈ 1/5 of that) | ~2 GB (315 MB database) |
 
 Subscan's `HEIGHT_SQL` must span its split block tables (a new
 `chain_blocks_<n>` every 1,000,000 blocks, `model/substrate.go:24` in the fork).
@@ -113,13 +113,29 @@ this once in the `sqwork` shell. Running it mid-catch-up double-counts.
 
 Blockscout needs nothing: its catchup fetcher fills missing ranges by itself.
 
+### Measured (2026-10-29, real Storj, real Subscan data)
+
+A 5.0 GB Subscan database (69,783 blocks, 3.3M events) gave a 0.98 GB dump.
+Dump plus upload took 58 s. Restore onto an empty volume took 56 s, download
+included, and Postgres was accepting connections at 61 s. Table counts and
+digests over every block hash and extrinsic hash matched the source.
+
+Storj notes, from the scoped production keys: a key scoped to `<folder>/` may
+list unfinished multipart uploads only under that folder (the bucket-wide
+listing is AccessDenied), and it is refused in other folders and other buckets.
+
 ## Tests
 
 ```sh
 sh test/dump-keys_test.sh       # key rules, no docker, seconds
 sh test/integration_test.sh     # both images vs a local MinIO, ~2 min
+
+# the same 39 checks against a real store (~90 s on Storj); everything is
+# written under <prefix>/run-<id>/ and deleted on exit
+S3_TEST_ENV=<file of S3_* lines> S3_TEST_ROOT=<prefix> sh test/integration_test.sh
 ```
 
 ⚠ MinIO accepts the aws-chunked uploads the real Storj gateway rejects, and it
-ignores a partial `--prefix` on `list-multipart-uploads`. A run against the
-live Storj gateway with the production grant is the gate before deploying.
+ignores a partial `--prefix` on `list-multipart-uploads`. So the run against the
+real store, with a key scoped like the production ones, is the gate before
+deploying.
