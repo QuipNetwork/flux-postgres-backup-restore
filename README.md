@@ -74,7 +74,7 @@ backup only: `PGHOST` `PGUSER` `PGPASSWORD` `PGDATABASE`, `HEARTBEAT_URL`,
 `BACKUP_INTERVAL` (s, default 21600), `BACKUP_RETRY` (s, default 1800),
 `BACKUP_RETENTION` (default 4), `BACKUP_DIR` (default `/backup`; give the sidecar
 its own volume sized for one dump, with headroom: any later `hdd` change is a
-wiping redeploy of the whole app), `PGD_COMPRESS` (default `zstd:3`),
+wiping redeploy of the whole app), `DUMP_COMPRESS` (default `zstd:3`),
 `MIN_DUMP_BYTES` (default 4096). With any S3 setting missing it idles and says
 so hourly instead of crash-looping.
 
@@ -89,15 +89,25 @@ so hourly instead of crash-looping.
 | Sidecar volume | ~40 GB (12 GB database at block 192k; dump ≈ 1/5 of that) | ~2 GB (315 MB database) |
 
 Subscan's `HEIGHT_SQL` must span its split block tables (a new
-`chain_blocks_<n>` every 1,000,000 blocks, `model/substrate.go:24` in the fork).
-This was checked on Postgres 17 against `chain_blocks` plus `chain_blocks_1`,
-and returns 0 with no tables:
+`chain_blocks_<n>` every 1,000,000 blocks, `model/substrate.go:24` in the fork;
+`chain_blocks_1` already exists, empty, well before block 1M). This was checked
+on Postgres 17 against `chain_blocks` plus `chain_blocks_1`, returns 0 with no
+tables, and returned 69783 on a real 69,784-block index:
 
 ```sql
-select coalesce(max((xpath('/row/m/text()', query_to_xml(format('select max(block_num) as m from %I', tablename), false, true, '')))[1]::text::bigint), 0) from pg_tables where schemaname = 'public' and tablename ~ '^chain_blocks(_[0-9]+)?$'
+select coalesce(max((xpath('/row/m/text()', query_to_xml(format('select max(block_num) as m from %I', tablename), false, true, '')))[1]::text::bigint), 0) from pg_tables where schemaname in ('public') and tablename ~ '^chain_blocks(_[0-9]+)?$'
 ```
 
 Blockscout's: `select coalesce(max(number),0) from blocks where consensus`.
+
+**Entering these in the Flux dashboard.** Write every env value with exactly
+one `=`, the one after the key. The cloud.runonflux.com env dialog stores rows
+as `KEY=value` split at the first `=`, so commas are safe. But its paste handler
+splits a pasted line that has more than one `=`: on `;`, on `,` (when there are
+fewer commas than `=`), or into space-separated `KEY=VALUE` tokens. And pasting
+a bare value that contains `=` into a value box creates a junk row. A JSON array
+of `"KEY=value"` strings is the safest paste. A mangled `HEIGHT_SQL` on the db
+component makes a good restore fail its height check and start empty.
 
 ### After a Subscan restore
 
