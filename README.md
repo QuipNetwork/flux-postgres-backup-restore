@@ -98,7 +98,13 @@ tables, and returned 69783 on a real 69,784-block index:
 select coalesce(max((xpath('/row/m/text()', query_to_xml(format('select max(block_num) as m from %I', tablename), false, true, '')))[1]::text::bigint), 0) from pg_tables where schemaname in ('public') and tablename ~ '^chain_blocks(_[0-9]+)?$'
 ```
 
-Blockscout's: `select coalesce(max(number),0) from blocks where consensus`.
+Blockscout's: `select count(*) from blocks where consensus`. Not `max(number)`:
+Blockscout indexes the newest blocks first and fills in backwards, so on a
+fresh index `max(number)` reaches the chain head within seconds while most
+blocks are still missing. A dump of that partial index would carry a full
+height, pass the guard and replace the good dumps. A count only grows as the
+index completes, and on a complete index it is `max(number) + 1`, so dumps
+labelled by either query compare correctly.
 
 **Entering these in the Flux dashboard.** Write every env value with exactly
 one `=`, the one after the key. The cloud.runonflux.com env dialog stores rows
