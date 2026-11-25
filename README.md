@@ -52,6 +52,34 @@ goes red whenever dumps stop, for any reason.
 The cadence is anchored on the newest **stored** dump, not on container start,
 so routine Flux restarts neither trigger an immediate dump nor delay the next.
 
+**One writer.** Before each cycle the sidecar reads Flux's list of the app's
+running instances (`https://api.runonflux.io/apps/location/<app>`). It stores
+nothing unless that list holds exactly one instance (`lib/flux-guard.sh`).
+Flux can run a second instance of an app whose spec asks for one: it did for
+observe.quip.network on 2026-11-23 (QUI-2518). Two sidecars on one prefix would
+abort each other's uploads in flight, and both would store and prune dumps of
+their own copy. While two run, both skip, so neither needs to know which node it
+is on. The skip is logged with its reason, and the cycle retries after
+`BACKUP_RETRY`.
+
+- **It fails closed.** These all skip:
+  - two or more instances
+  - an unreadable list
+  - an answer that isn't a successful one
+  - an empty list
+- **The empty list is the trap.** Flux answers an unknown app name with
+  `success` and no entries. Counting zero as fine would let a wrong name switch
+  the guard off silently.
+- **A run of skips is visible:** it stops the heartbeat, like any cycle that
+  stores nothing.
+- **The app name comes from `PGHOST`.** Flux names a component's host
+  `flux<component>_<app>`, and `fluxsqdb_quipsubscan` gives `quipsubscan`. So
+  one image serves every app, and the specs need no new variable.
+  `FLUX_APP_NAME` overrides it.
+- ⚠ **A dead node can stay listed** until its entry's `expireAt`, about 2 h after
+  its last broadcast. After a move off a node that died, dumps can skip for up
+  to that long.
+
 `backup-loop.sh --once` takes one dump now (exit 0 if stored). Use it from the
 sidecar's shell before planned maintenance.
 
@@ -75,8 +103,10 @@ backup only: `PGHOST` `PGUSER` `PGPASSWORD` `PGDATABASE`, `HEARTBEAT_URL`,
 `BACKUP_RETENTION` (default 4), `BACKUP_DIR` (default `/backup`; give the sidecar
 its own volume sized for one dump, with headroom: any later `hdd` change is a
 wiping redeploy of the whole app), `DUMP_COMPRESS` (default `zstd:3`),
-`MIN_DUMP_BYTES` (default 4096). With any S3 setting missing it idles and says
-so hourly instead of crash-looping.
+`MIN_DUMP_BYTES` (default 4096), `FLUX_APP_NAME` (default: the app part of
+`PGHOST`), `FLUX_LOCATION_URL` (default the public API's location route; tests
+point it at a `file://` list). With any S3 setting missing it idles and says so
+hourly instead of crash-looping.
 
 ### Per app
 
@@ -154,14 +184,30 @@ listing is AccessDenied), and it is refused in other folders and other buckets.
 
 ```sh
 sh test/dump-keys_test.sh       # key rules, no docker, seconds
-sh test/integration_test.sh     # both images vs a local MinIO, ~2 min
+sh test/flux-guard_test.sh      # the one-writer guard, no docker, seconds (needs curl, jq)
+sh test/integration_test.sh     # both images vs a local SeaweedFS, ~3 min
 
-# the same 39 checks against a real store (~90 s on Storj); everything is
+# the same 52 checks against a real store (~110 s on Storj); everything is
 # written under <prefix>/run-<id>/ and deleted on exit
 S3_TEST_ENV=<file of S3_* lines> S3_TEST_ROOT=<prefix> sh test/integration_test.sh
 ```
 
-⚠ MinIO accepts the aws-chunked uploads the real Storj gateway rejects, and it
-ignores a partial `--prefix` on `list-multipart-uploads`. So the run against the
-real store, with a key scoped like the production ones, is the gate before
-deploying.
+The integration test mounts Flux's instance list into every sidecar run as a
+file, one instance by default, so no run ever reads the real API. Its "one
+writer" cases rewrite that file:
+
+- **Two instances, none, or a list that can't be read:** each must skip,
+  storing nothing, sending no heartbeat, and leaving an upload in flight alone.
+- **The production naming:** the app's name must come from a Flux-style
+  `PGHOST`.
+
+⚠ A local store accepts requests the real Storj gateway rejects, such as
+aws-chunked uploads. MinIO, the store this test used until its images stopped
+pulling in 2026-11, also ignored a partial `--prefix` on
+`list-multipart-uploads`. So the run against the real store, with a key scoped
+like the production ones, is the gate before deploying.
+
+Last run against Storj: 52 of 52 passed in 1m49s on 2026-11-25, for the one-writer
+guard. The key was scoped like production's: `rehearsal/` only, refused on the
+other prefixes and on the bucket-wide multipart listing, expiring after 24 h. The
+run left no objects and no unfinished uploads.

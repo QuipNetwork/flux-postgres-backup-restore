@@ -12,18 +12,25 @@
 #     that is lower than its key claims) ends in an EMPTY database that the
 #     app re-indexes, never a crash loop and never a half-restored schema;
 #   - the height guard stops a re-indexing app from replacing good dumps;
+#   - the one-writer guard stores nothing unless Flux lists exactly one
+#     instance of the app: not for two, not for none, not for an unreadable
+#     list; and the image derives the app's name from a Flux PGHOST;
 #   - pruning keeps the newest N, a dead cycle's multipart upload is aborted,
 #     and a restarted sidecar waits out the cadence instead of dumping at once.
 #
-# MinIO stands in for Storj. ⚠ MinIO accepts the aws-chunked uploads that the
-# real Storj gateway rejects (MissingContentLength), so this test cannot catch
-# that class of bug. The scripts set *_CHECKSUM_*=when_required for it, and the
-# rehearsal against the live gateway is the gate for it.
+# SeaweedFS stands in for Storj (MinIO's images stopped pulling in 2026-11,
+# found in QUI-2496). ⚠ A local store accepts requests the real Storj gateway
+# rejects, such as aws-chunked uploads (MissingContentLength), so this test
+# cannot catch that class of bug. The scripts set *_CHECKSUM_*=when_required
+# for it, and the rehearsal against the live gateway is the gate for it.
+#
+# Flux's instance list is a file mounted into every sidecar run (FLUX_LOCATION_URL
+# is a file:// URL), one instance by default. No run ever reads the real API.
 #
 # Run:  sh test/integration_test.sh
 #       SKIP_BUILD=1 to reuse already-built :test images.
 #
-# Against a real store (the gate MinIO cannot be):
+# Against a real store (the gate a local store cannot be):
 #       S3_TEST_ENV=<file> S3_TEST_ROOT=<prefix> sh test/integration_test.sh
 # <file> holds S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY lines, for
 # example a Storj key scoped to <prefix>. Everything the run writes lives under
@@ -41,8 +48,10 @@ RUN="fpbrt$$"
 NET="${RUN}-net"
 DB_IMG="${DB_IMAGE:-flux-postgres-backup-restore:db-test}"
 BK_IMG="${BACKUP_IMAGE:-flux-postgres-backup-restore:backup-test}"
-S3_IMG="minio/minio:RELEASE.2025-04-22T22-12-26Z"
-HB_IMG="busybox:latest"
+S3_IMG="chrislusf/seaweedfs:4.52@sha256:57877e32bb90073b37dc109b438ba66e84fd5ed9ced5f5c04f56444ef243ce59"
+HB_IMG="busybox:1.37"
+FLUXDIR="$(mktemp -d)"   # the instance list the sidecars read, as /flux/location.json
+chmod 755 "$FLUXDIR"
 
 S3_HOST="${RUN}-s3"
 HB_HOST="${RUN}-hb"
@@ -96,6 +105,7 @@ cleanup() {
     # shellcheck disable=SC2086
     [ -z "$VOLUMES" ] || docker volume rm $VOLUMES >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
+    rm -rf "$FLUXDIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -169,7 +179,21 @@ bkenv() { # DB PREFIX -- the sidecar's settings, as docker -e flags
     s3env
     printf '%s\n' -e "PGHOST=${RUN}-$1" -e PGUSER=app -e PGPASSWORD=apppw -e PGDATABASE=appdb \
         -e "S3_PREFIX=$2" -e DUMP_NAME=testapp \
-        -e "HEARTBEAT_URL=http://${HB_HOST}:8080/hb-$2" -e BACKUP_DIR=/tmp
+        -e "HEARTBEAT_URL=http://${HB_HOST}:8080/hb-$2" -e BACKUP_DIR=/tmp \
+        -e FLUX_APP_NAME=testapp -e FLUX_LOCATION_URL=file:///flux/location.json \
+        -v "${FLUXDIR}:/flux:ro"
+}
+
+# flux_list ENTRY_IP... -- what Flux "runs" for app testapp from now on: one
+# entry per IP given, none for no arguments. Written whole, then renamed in.
+flux_list() {
+    _data=""
+    for _ip in "$@"; do
+        _data="${_data:+${_data},}{\"name\":\"testapp\",\"ip\":\"${_ip}\",\"runningSince\":\"2026-11-25T00:00:00.000Z\"}"
+    done
+    printf '{"status":"success","data":[%s]}' "$_data" >"${FLUXDIR}/location.json.new"
+    chmod 644 "${FLUXDIR}/location.json.new"
+    mv "${FLUXDIR}/location.json.new" "${FLUXDIR}/location.json"
 }
 # HEIGHT_SQL holds spaces, so it is never part of bkenv's word-split output;
 # every caller passes it as its own quoted argument.
@@ -184,8 +208,8 @@ backup_once() {
 }
 
 uploads() { # PREFIX -- keys with an unfinished multipart upload. Both
-    # listings, as the loop does: MinIO ignores a partial --prefix for this
-    # call, and a prefix-scoped Storj key is refused the bucket-wide one.
+    # listings, as the loop does: some stores ignore a partial --prefix for this
+    # call (MinIO did), and a prefix-scoped Storj key is refused the bucket-wide one.
     { s3 s3api list-multipart-uploads --bucket "$BUCKET" --prefix "$1/" \
           --query 'Uploads[].Key' --output text 2>/dev/null
       s3 s3api list-multipart-uploads --bucket "$BUCKET" \
@@ -212,10 +236,19 @@ docker volume create "${RUN}-xfer" >/dev/null
 CONTAINERS="$CONTAINERS $HB_HOST"
 if [ -z "$EXTERNAL" ]; then
     CONTAINERS="$CONTAINERS $S3_HOST"
+    # One identity with the test's key; -ip must be the container's own name so
+    # the master, volume and S3 servers inside it can find each other.
+    # shellcheck disable=SC2016  # expanded inside the container
     docker run -d --name "$S3_HOST" --network "$NET" \
-        -e "MINIO_ROOT_USER=${S3_USER}" -e "MINIO_ROOT_PASSWORD=${S3_PASS}" \
-        "$S3_IMG" server /data >/dev/null
+        -e "SW_IP=${S3_HOST}" -e "SW_KEY=${S3_USER}" -e "SW_SECRET=${S3_PASS}" \
+        --entrypoint /bin/sh "$S3_IMG" -c '
+            umask 077
+            printf "{\"identities\":[{\"name\":\"test\",\"credentials\":[{\"accessKey\":\"%s\",\"secretKey\":\"%s\"}],\"actions\":[\"Admin\",\"Read\",\"Write\",\"List\",\"Tagging\"]}]}" \
+                "$SW_KEY" "$SW_SECRET" > /tmp/s3.json
+            exec weed server -dir=/data -ip="$SW_IP" -ip.bind=0.0.0.0 -volume.max=10 \
+                -master.telemetry=false -s3 -s3.port=9000 -s3.config=/tmp/s3.json' >/dev/null
 fi
+flux_list 10.1.0.1:16127   # the default: Flux runs one instance
 # A one-request-at-a-time HTTP sink; busybox nc prints each request line.
 docker run -d --name "$HB_HOST" --network "$NET" "$HB_IMG" sh -c \
     'while :; do printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" | nc -l -p 8080; done' >/dev/null
@@ -225,9 +258,17 @@ if [ -n "$EXTERNAL" ]; then
 else
     i=0
     until s3 s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1; do
-        i=$((i + 1)); [ "$i" -lt 30 ] || { echo "FATAL: test S3 never came up"; exit 1; }
+        i=$((i + 1)); [ "$i" -lt 90 ] || { echo "FATAL: test S3 never came up"; exit 1; }
         sleep 1
     done
+    # SeaweedFS answers listings about 30 s before it takes writes ("master is
+    # warming up"), so wait for a real write before any case relies on one.
+    i=0
+    until s3 s3api put-object --bucket "$BUCKET" --key warmup >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -lt 90 ] || { echo "FATAL: test S3 never took a write"; exit 1; }
+        sleep 1
+    done
+    s3 s3api delete-object --bucket "$BUCKET" --key warmup >/dev/null 2>&1
 fi
 
 # ── Cases ─────────────────────────────────────────────────────────────────────
@@ -273,6 +314,42 @@ assert_rc "a lower index is not uploaded" 1 "$BK_RC"
 assert_has "says why" "refusing" "$BK_OUT"
 assert_eq "stored keys unchanged" "$K500" "$(keys "$MAIN")"
 assert_eq "no heartbeat for a refused dump" "1" "$(heartbeats "$MAIN")"
+
+echo "one writer"
+# a's index moves past the stored height, so only the one-writer guard can
+# stop these cycles: the height guard would let them through.
+seed a 550
+# The first thing two writers break: one cycle aborting the other's upload
+# mid-way. This one stands in for a real instance's upload in flight.
+INFLIGHT="${MAIN}/testapp-20991231T000000Z-h550.dump"
+s3 s3api create-multipart-upload --bucket "$BUCKET" --key "$INFLIGHT" >/dev/null
+flux_list 10.1.0.1:16127 10.1.0.2:16127
+backup_once a "$MAIN"
+assert_rc "two instances: no dump taken" 1 "$BK_RC"
+assert_has "two instances: names both" "2 instances of testapp (10.1.0.1:16127, 10.1.0.2:16127)" "$BK_OUT"
+flux_list
+backup_once a "$MAIN"
+assert_rc "no instance listed: no dump taken" 1 "$BK_RC"
+assert_has "no instance listed: says so" "no instance of testapp" "$BK_OUT"
+rm -f "${FLUXDIR}/location.json"
+backup_once a "$MAIN"
+assert_rc "unreadable list: no dump taken" 1 "$BK_RC"
+assert_has "unreadable list: says so" "could not read the instance list" "$BK_OUT"
+assert_eq "nothing stored while skipping" "$K500" "$(keys "$MAIN")"
+assert_eq "no heartbeat while skipping" "1" "$(heartbeats "$MAIN")"
+assert_eq "an upload in flight survives every skip" "$INFLIGHT" "$(uploads "$MAIN" | grep '/testapp-')"
+# The app's name from a Flux PGHOST, as in production (flux<component>_<app>),
+# with no FLUX_APP_NAME: the host is a's address under a Flux-style name.
+flux_list 10.1.0.1:16127
+A_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${NET}\").IPAddress}}" "${RUN}-a")"
+backup_once a "$MAIN" -e FLUX_APP_NAME= -e PGHOST=fluxdb_testapp --add-host "fluxdb_testapp:${A_IP}"
+assert_rc "one instance, name from PGHOST: dump taken" 0 "$BK_RC"
+case "$(keys "$MAIN" | tail -n 1)" in
+    "$MAIN"/testapp-*-h550.dump) pass "the new dump carries height 550" ;;
+    *) fail "the new dump carries height 550 (got '$(keys "$MAIN" | tail -n 1)')" ;;
+esac
+assert_eq "heartbeat sent again" "2" "$(heartbeats "$MAIN")"
+assert_eq "with one writer again, the dead upload is aborted" "" "$(uploads "$MAIN" | grep '/testapp-')"
 
 echo "retention and dead multipart uploads"
 # A cycle killed mid-upload leaves an unfinished multipart upload: invisible as
