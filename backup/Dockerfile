@@ -11,17 +11,19 @@
 ARG PG_IMAGE=postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b
 FROM ${PG_IMAGE}
 
-# coreutils for `date -d` (the cadence is computed from the newest key's stamp).
+# coreutils for `date -d` (the cadence is computed from the newest key's stamp),
+# jq for the one-writer check's reading of Flux's instance list.
 # This container holds the object-store keys, so the trust store gets the same
 # eMudhra assert as the db image (QUI-1959, parent QUI-1923).
 COPY trust-store/assert-fixed-bundle.sh /tmp/assert-fixed-bundle.sh
-RUN apk add --no-cache aws-cli coreutils curl \
+RUN apk add --no-cache aws-cli coreutils curl jq \
  && apk add --no-cache --upgrade ca-certificates-bundle \
  && sh /tmp/assert-fixed-bundle.sh /etc/ssl/certs/ca-certificates.crt \
  && rm /tmp/assert-fixed-bundle.sh
 ENV AWS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
 COPY lib/dump-keys.sh /usr/local/lib/dump-keys.sh
+COPY lib/flux-guard.sh /usr/local/lib/flux-guard.sh
 COPY backup/backup-loop.sh /usr/local/bin/backup-loop.sh
 RUN chmod 0755 /usr/local/bin/backup-loop.sh
 

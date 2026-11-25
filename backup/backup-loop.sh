@@ -5,6 +5,11 @@
 # restore it after a Flux relocation instead of re-indexing from genesis.
 #
 # One cycle:
+#   0. ONE WRITER: store nothing unless Flux runs exactly one instance of this
+#      app (lib/flux-guard.sh). Flux can run a second one although the spec
+#      asks for one; two sidecars on one prefix would abort each other's
+#      uploads (step 3) and store and prune dumps of two copies. While two run,
+#      both skip. An unreadable or empty instance list skips too.
 #   1. Read the index height (HEIGHT_SQL) and the newest stored dump's height.
 #   2. HEIGHT GUARD: dump only if the height is above 0 and not below the
 #      newest stored. After a failed restore the app re-indexes from genesis;
@@ -45,6 +50,11 @@
 #                     capped near 10 GB on Flux.
 #   DUMP_COMPRESS      pg_dump --compress, default zstd:3
 #   MIN_DUMP_BYTES    a smaller dump counts as failed, default 4096
+#   FLUX_APP_NAME     the Flux app, for the one-writer check; default: the app
+#                     part of PGHOST (flux<component>_<app>), which is why the
+#                     specs need no new variable
+#   FLUX_LOCATION_URL where to read the running instances; default the public
+#                     API, https://api.runonflux.io/apps/location/<app>. For tests.
 
 set -uo pipefail
 
@@ -55,6 +65,8 @@ log() { echo "[backup] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
 # shellcheck source=../lib/dump-keys.sh
 . /usr/local/lib/dump-keys.sh
+# shellcheck source=../lib/flux-guard.sh
+. /usr/local/lib/flux-guard.sh
 
 for v in PGHOST PGUSER PGDATABASE; do
     [ -n "${!v:-}" ] || { log "FATAL: $v is required"; exit 1; }
@@ -153,7 +165,13 @@ prune() {
 
 # cycle -- rc 0 only if a dump was stored.
 cycle() {
-    local height listing newest newest_h stamp key file size remote started
+    local height listing newest newest_h stamp key file size remote started why
+
+    # Before anything touches the store, aborting uploads and pruning included.
+    if ! why="$(sole_instance 2>&1)"; then
+        log "skipping this backup: ${why}"
+        return 1
+    fi
 
     if ! height="$(psql -X -q -tA -c "$HEIGHT_SQL" 2>&1)"; then
         log "ERROR: height query failed: ${height}"
@@ -258,8 +276,13 @@ wait_for_postgres() {
     done
 }
 
+if FLUX_APP="$(flux_app_name)"; then
+    INSTANCES="$(flux_location_url "$FLUX_APP")"
+else
+    INSTANCES="UNKNOWN (set FLUX_APP_NAME; every cycle will skip)"
+fi
 log "starting: db=${PGHOST}/${PGDATABASE} store=s3://${S3_BUCKET}/${S3_PREFIX}/ name=${DUMP_NAME}" \
-    "interval=${INTERVAL}s retry=${RETRY}s retention=${RETENTION}"
+    "interval=${INTERVAL}s retry=${RETRY}s retention=${RETENTION} instances=${INSTANCES}"
 wait_for_postgres || exit 1
 
 if [ "$ONCE" -eq 1 ]; then
